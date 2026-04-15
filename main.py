@@ -62,20 +62,57 @@ def _mark_as_processed(key: str) -> None:
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Tokeny se načítají automaticky z environment variables s prefixem BB_TOKEN_
-# Stačí přidat do Railway: BB_TOKEN_BIESSE_WEB, BB_TOKEN_JIP_SHOP atd.
-# Název proměnné: BB_TOKEN_ + název repo VELKÝMI PÍSMENY s pomlčkami nahrazenými podtržítky
-# Příklad: repo "biesse-web" → BB_TOKEN_BIESSE_WEB
-def _load_bb_tokens() -> dict[str, str]:
-    tokens = {}
-    for key, value in os.environ.items():
-        if key.startswith("BB_TOKEN_") and value:
-            # BB_TOKEN_BIESSE_WEB → biesse-web
-            repo_slug = key[len("BB_TOKEN_"):].lower().replace("_", "-")
-            tokens[repo_slug] = value
-    return tokens
+# ---------------------------------------------------------------------------
+# Bitbucket OAuth2 — jeden Client ID + Secret pro celý workspace
+# V Railway nastav: BB_OAUTH_CLIENT_ID, BB_OAUTH_CLIENT_SECRET
+# Fallback: pokud OAuth není nastaven, použije per-repo BB_TOKEN_* tokeny
+# ---------------------------------------------------------------------------
+BB_OAUTH_CLIENT_ID     = os.environ.get("BB_OAUTH_CLIENT_ID", "")
+BB_OAUTH_CLIENT_SECRET = os.environ.get("BB_OAUTH_CLIENT_SECRET", "")
 
-BB_TOKENS = _load_bb_tokens()
+# Cache OAuth tokenu — aby se nevolalo Bitbucket API při každém requestu
+_oauth_token_cache: dict[str, object] = {"token": None, "expires_at": 0.0}
+
+async def _get_oauth_token() -> str:
+    """
+    Získá platný OAuth2 access token pomocí client_credentials grant.
+    Token se cachuje a automaticky obnovuje před expirací.
+    """
+    if _oauth_token_cache["token"] and time.time() < _oauth_token_cache["expires_at"] - 60:
+        return _oauth_token_cache["token"]
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://bitbucket.org/site/oauth2/access_token",
+            data={"grant_type": "client_credentials"},
+            auth=(BB_OAUTH_CLIENT_ID, BB_OAUTH_CLIENT_SECRET),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _oauth_token_cache["token"] = data["access_token"]
+        _oauth_token_cache["expires_at"] = time.time() + data.get("expires_in", 7200)
+        print(f"[OAuth] Nový token získán, platný {data.get('expires_in', 7200)}s")
+        return _oauth_token_cache["token"]
+
+async def get_bb_token(repo_slug: str) -> str:
+    """
+    Vrátí token pro daný repozitář.
+    Priorita: 1) OAuth (jeden pro vše), 2) per-repo BB_TOKEN_* (fallback)
+    """
+    if BB_OAUTH_CLIENT_ID and BB_OAUTH_CLIENT_SECRET:
+        return await _get_oauth_token()
+
+    # Fallback na per-repo tokeny
+    env_name = f"BB_TOKEN_{repo_slug.upper().replace('-', '_')}"
+    token = os.environ.get(env_name, "")
+    if not token:
+        raise HTTPException(400,
+            f"Chybí autentizace pro '{repo_slug}'. "
+            f"Přidej BB_OAUTH_CLIENT_ID + BB_OAUTH_CLIENT_SECRET (doporučeno) "
+            f"nebo '{env_name}' do Railway Variables."
+        )
+    return token
 
 JIRA_BASE_URL  = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL     = os.environ.get("JIRA_EMAIL", "")
@@ -846,11 +883,8 @@ async def bitbucket_webhook(request: Request):
     if not all([pr_id, workspace, repo_slug, diff_url]):
         raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}'")
 
-    # Vyber token podle repozitáře
-    token = BB_TOKENS.get(repo_slug, "")
-    if not token:
-        env_name = f"BB_TOKEN_{repo_slug.upper().replace('-', '_')}"
-        raise HTTPException(400, f"Chybí BB token pro repozitář '{repo_slug}' – přidej '{env_name}' do Railway Variables")
+    # Získej token pro repozitář (OAuth nebo per-repo fallback)
+    token = await get_bb_token(repo_slug)
 
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
@@ -991,7 +1025,7 @@ async def bitbucket_webhook(request: Request):
         category  = item.get("category", "")
         if not file_path or not line or not comment:
             return False
-        text = f"{format_severity(severity)} {format_category(category)}\n\n{comment}"
+        text = f"🤖 **Claude - Code Review**\n---\n{format_severity(severity)} {format_category(category)}\n\n{comment}"
         await post_bitbucket_comment(workspace, repo_slug, pr_id, text, token,
                                      file_path=file_path, line=line)
         return True
@@ -1010,7 +1044,7 @@ async def health():
     return {
         "status": "ok",
         "anthropic": "ok" if ANTHROPIC_API_KEY else "missing",
-        "repos_configured": configured_repos,
+        "auth_mode": "oauth" if (BB_OAUTH_CLIENT_ID and BB_OAUTH_CLIENT_SECRET) else "per-repo-tokens",
         "jira": "ok" if JIRA_BASE_URL else "missing JIRA_BASE_URL",
         "webhook_secret": "ok" if BB_WEBHOOK_SECRET else "⚠️ not set — webhook not verified",
         "poc_config": {
