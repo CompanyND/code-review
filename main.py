@@ -590,7 +590,110 @@ def _extract_text(field) -> str:
     return " ".join(texts).strip()
 
 
-def build_prompt(
+def build_system_prompt() -> str:
+    """
+    Statická část promptu — instrukce, JSON schéma, kategorie.
+    Cachuje se na Anthropic API (cache_control: ephemeral, TTL ~1 hodina).
+    Obnoví se automaticky při každém Railway deployi.
+    """
+    return """Tvoje úloha: code review PR. Výstup čte autor PR, který chce vědět, co opravit před mergem.
+
+Při review se ptej:
+- Bude tento kód čitelný za 2 roky bez původního autora?
+- Co se stane když tato funkce dostane 10x více requestů?
+- Kde jsou skryté memory leaky, race conditions nebo N+1 dotazy?
+- Co rozbije první deployment v pátek v 17:00?
+- Jsou edge cases ošetřeny nebo jen happy path?
+- Je kód testovatelný? Lze ho mockovat a unit testovat?
+- Vzniká technický dluh který bude za rok bolet?
+
+Zásady pro tvoje hodnocení:
+- Pokud něco nevíš nebo nemáš dostatečný kontext, napiš to explicitně — NEVYMÝŠLEJ.
+- Pokud diff ukazuje jen část souboru a nevidíš celý kontext, uveď to jako omezení.
+- Nezmiňuj obecné "best practices" pokud nejsou porušeny přímo v tomto diffu.
+- Pokud je kód v pořádku, řekni to — nepřidávej umělé výhrady jen aby review vypadalo důkladněji.
+- U každého nálezu musíš být schopen říct: "Na řádku X v souboru Y vidím konkrétně toto."
+- Piš stručně — 2-3 věty většinou stačí, ale neobětuj přesnost za stručnost.
+- Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:"
+- Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně."
+- Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování.
+- Ignoruj importy a přejmenovávání souborů jako standalone nálezy.
+- Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview.
+- Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku.
+- Projekt je legacy — nenavrhuj architektonické přepisy (DI, interface pattern) pokud nejsou součástí PR. Konzistentní pattern v projektu = záměr, ne chyba.
+- Pokud kód obsahuje komentář vysvětlující PROČ je něco uděláno daným způsobem, respektuj ho jako záměr autora a nehlašuj to jako problém.
+- Buď střídmý — preferuj 2-3 konkrétní nálezy nad mnoha vágními. Pokud nevidíš reálný problém, řekni to a vrať APPROVE. Není nutné vždy něco najít.
+
+Tento projekt je multi-stack: Angular (TypeScript), .NET (C#), HTML, SASS.
+Přizpůsob review danému jazyku a jeho konvencím. Konkrétní stack verze dostaneš v každém requestu.
+
+- Pro HTML/SASS: sleduj Core Web Vitals:
+  - LCP: chybějící lazy loading na obrázcích, chybějící preload na kritických zdrojích, render-blocking CSS/JS
+  - CLS: chybějící width/height na obrázcích a embedech, layout shifty při načítání fontů (font-display)
+  - INP: těžké CSS animace na width/margin/top místo transform/opacity které jdou přes compositor
+  Přístupnost (WCAG 2.2) — reportuj pouze pokud vidíš konkrétní porušení v diffu:
+  - Chybějící alt text na obrázcích (nebo alt="" pro dekorativní obrázky)
+  - Interaktivní prvky bez label (input bez label/aria-label, button bez textu nebo aria-label)
+  - Špatná heading hierarchie (h1→h3 bez h2, více h1 na stránce)
+  - Chybějící focus styles (outline: none bez náhrady)
+  - Nízký kontrast barev — POUZE pokud vidíš hardcoded barvy v HTML/SASS, nespekuluj
+  - Klikatelné div/span elementy bez role="button" a tabindex="0"
+  - Formuláře bez správných label vazeb, chybějící aria-required
+  - Dynamický obsah bez aria-live pro screen readery
+
+Proveď code review a vrať odpověď jako JSON objekt s touto strukturou:
+
+{
+  "summary": {
+    "overview": "Stručný přehled co PR dělá (2-3 věty)",
+    "recommendation": "APPROVE nebo REQUEST CHANGES nebo NEEDS DISCUSSION",
+    "key_points": ["bod 1", "bod 2", "bod 3"],
+    "bugs": "🐛 Bugy a logické chyby – konkrétní problémy, nebo null pokud žádné",
+    "security": "🔒 Bezpečnost – konkrétní rizika, nebo null pokud žádné",
+    "performance": "⚡ Výkon – konkrétní problémy, nebo null pokud žádné",
+    "tests": "🧪 Unit testy – které testy chybí s názvy, nebo null pokud vše pokryto",
+    "architecture": "🏗️ Návrh a architektura – konkrétní problémy, nebo null pokud OK",
+    "readability": "📖 Čitelnost a konvence – konkrétní problémy, nebo null pokud OK",
+    "regression_risk": "🔄 Riziko regresí – co může rozbít, nebo null pokud žádné riziko",
+    "goal_alignment": "🎯 Soulad se zadáním – problémy nebo null pokud vše OK"
+  },
+  "inline_comments": [
+    {
+      "file": "cesta/k/souboru.ts",
+      "line": 42,
+      "severity": "critical|major|minor|nit",
+      "category": "bug|security|performance|test|readability|architecture|config|error_handling|logging|migration|dependency|concurrency",
+      "comment": "Popis problému a navržená oprava"
+    }
+  ]
+}
+
+Pravidla pro inline komentáře:
+- `file` musí být přesná cesta souboru z diff (např. "src/orders/order.service.ts")
+- `line` musí být číslo řádku z diff (číslo řádku v novém souboru po změně, označené "+")
+- Uváděj jen konkrétní, podstatné problémy — ne obecné poznámky
+- Ke každému problému navrhni stručnou opravu
+- Pokud nejsou nalezeny žádné problémy v dané kategorii, nevymýšlej je
+
+Kategorie:
+- bug: chyba v logice, neošetřená výjimka, špatná podmínka
+- security: XSS, SQL injection, citlivá data, autorizace
+- performance: N+1, zbytečné dotazy, velké cykly
+- test: chybějící unit testy pro změněné funkce
+- readability: špatné pojmenování, složitost, DRY
+- architecture: těsná vazba, špatný návrh
+- config: hardcoded hodnoty, chybějící env variables, secrets v kódu
+- error_handling: spolykané výjimky, chybějící fallback, špatné HTTP status kódy
+- logging: chybějící logy pro kritické operace, logování citlivých dat
+- migration: breaking changes v DB schématu, chybějící rollback strategie
+- dependency: nová závislost bez zdůvodnění, zranitelná verze balíčku
+- concurrency: race condition, chybějící zamykání, problém při paralelním zpracování
+
+Vrať POUZE validní JSON bez jakéhokoliv dalšího textu nebo markdown backticks.
+Všechny texty v JSON piš v češtině. Technické termíny, názvy metod, proměnných, knihoven a programátorský slang ponechej v originále (např. "N+1 query", "race condition", "memory leak", názvy funkcí atd.)."""
+
+
+def build_user_prompt(
     diff: str,
     jira: dict,
     pr_title: str,
@@ -599,7 +702,10 @@ def build_prompt(
     angular_version: str | None = None,
     dotnet_version: str | None = None,
 ) -> str:
-    """Sestaví prompt pro Claude — včetně stack kontextu a filtrovaných souborů."""
+    """
+    Dynamická část promptu — diff, Jira kontext, stack verze.
+    Posílá se bez cache — mění se s každým PR.
+    """
     jira_section = ""
     if jira:
         jira_section = f"""
@@ -639,51 +745,10 @@ def build_prompt(
 
     diff_preview = diff[:16000] + ("\n...[diff zkrácen]" if len(diff) > 16000 else "")
 
-    return f"""Tvoje úloha: code review PR. Výstup čte autor PR, který chce vědět, co opravit před mergem.
-
-Při review se ptej:
-- Bude tento kód čitelný za 2 roky bez původního autora?
-- Co se stane když tato funkce dostane 10x více requestů?
-- Kde jsou skryté memory leaky, race conditions nebo N+1 dotazy?
-- Co rozbije první deployment v pátek v 17:00?
-- Jsou edge cases ošetřeny nebo jen happy path?
-- Je kód testovatelný? Lze ho mockovat a unit testovat?
-- Vzniká technický dluh který bude za rok bolet?
-
-Zásady pro tvoje hodnocení:
-- Pokud něco nevíš nebo nemáš dostatečný kontext, napiš to explicitně — NEVYMÝŠLEJ.
-- Pokud diff ukazuje jen část souboru a nevidíš celý kontext, uveď to jako omezení.
-- Nezmiňuj obecné "best practices" pokud nejsou porušeny přímo v tomto diffu.
-- Pokud je kód v pořádku, řekni to — nepřidávej umělé výhrady jen aby review vypadalo důkladněji.
-- U každého nálezu musíš být schopen říct: "Na řádku X v souboru Y vidím konkrétně toto."
-- Piš stručně — 2-3 věty většinou stačí, ale neobětuj přesnost za stručnost.
-- Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:"
-- Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně."
-- Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování.
-- Ignoruj importy a přejmenovávání souborů jako standalone nálezy.
-- Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview.
-- Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku.
-- Projekt je legacy — nenavrhuj architektonické přepisy (DI, interface pattern) pokud nejsou součástí PR. Konzistentní pattern v projektu = záměr, ne chyba.
-- Pokud kód obsahuje komentář vysvětlující PROČ je něco uděláno daným způsobem, respektuj ho jako záměr autora a nehlašuj to jako problém.
-- Buď střídmý — preferuj 2-3 konkrétní nálezy nad mnoha vágními. Pokud nevidíš reálný problém, řekni to a vrať APPROVE. Není nutné vždy něco najít.
-
-Tento projekt je multi-stack: Angular (TypeScript), .NET (C#), HTML, SASS.
-Přizpůsob review danému jazyku a jeho konvencím podle těchto pravidel:
-
+    return f"""## Stack verze tohoto projektu
 {stack_section}
-- Pro HTML/SASS: sleduj Core Web Vitals:
-  - LCP: chybějící lazy loading na obrázcích, chybějící preload na kritických zdrojích, render-blocking CSS/JS
-  - CLS: chybějící width/height na obrázcích a embedech, layout shifty při načítání fontů (font-display)
-  - INP: těžké CSS animace na width/margin/top místo transform/opacity které jdou přes compositor
-  Přístupnost (WCAG 2.2) — reportuj pouze pokud vidíš konkrétní porušení v diffu:
-  - Chybějící alt text na obrázcích (nebo alt="" pro dekorativní obrázky)
-  - Interaktivní prvky bez label (input bez label/aria-label, button bez textu nebo aria-label)
-  - Špatná heading hierarchie (h1→h3 bez h2, více h1 na stránce)
-  - Chybějící focus styles (outline: none bez náhrady)
-  - Nízký kontrast barev — POUZE pokud vidíš hardcoded barvy v HTML/SASS, nespekuluj
-  - Klikatelné div/span elementy bez role="button" a tabindex="0"
-  - Formuláře bez správných label vazeb, chybějící aria-required
-  - Dynamický obsah bez aria-live pro screen readery
+- security (rozšíření): {dotnet_sec}
+- performance (rozšíření): {dotnet_perf}, {angular_perf}
 
 ## Pull request
 **Název PR:** {pr_title}
@@ -694,62 +759,40 @@ Přizpůsob review danému jazyku a jeho konvencím podle těchto pravidel:
 ```diff
 {diff_preview}
 ```
-
-Proveď code review a vrať odpověď jako JSON objekt s touto strukturou:
-
-{{
-  "summary": {{
-    "overview": "Stručný přehled co PR dělá (2-3 věty)",
-    "recommendation": "APPROVE nebo REQUEST CHANGES nebo NEEDS DISCUSSION",
-    "key_points": ["bod 1", "bod 2", "bod 3"],
-    "bugs": "🐛 Bugy a logické chyby – konkrétní problémy, nebo null pokud žádné",
-    "security": "🔒 Bezpečnost – konkrétní rizika, nebo null pokud žádné",
-    "performance": "⚡ Výkon – konkrétní problémy, nebo null pokud žádné",
-    "tests": "🧪 Unit testy – které testy chybí s názvy, nebo null pokud vše pokryto",
-    "architecture": "🏗️ Návrh a architektura – konkrétní problémy, nebo null pokud OK",
-    "readability": "📖 Čitelnost a konvence – konkrétní problémy, nebo null pokud OK",
-    "regression_risk": "🔄 Riziko regresí – co může rozbít, nebo null pokud žádné riziko",
-    "goal_alignment": "🎯 Soulad se zadáním – problémy nebo null pokud vše OK"
-  }},
-  "inline_comments": [
-    {{
-      "file": "cesta/k/souboru.ts",
-      "line": 42,
-      "severity": "critical|major|minor|nit",
-      "category": "bug|security|performance|test|readability|architecture|config|error_handling|logging|migration|dependency|concurrency",
-      "comment": "Popis problému a navržená oprava"
-    }}
-  ]
-}}
-
-Pravidla pro inline komentáře:
-- `file` musí být přesná cesta souboru z diff (např. "src/orders/order.service.ts")
-- `line` musí být číslo řádku z diff (číslo řádku v novém souboru po změně, označené "+")
-- Uváděj jen konkrétní, podstatné problémy — ne obecné poznámky
-- Ke každému problému navrhni stručnou opravu
-- Pokud nejsou nalezeny žádné problémy v dané kategorii, nevymýšlej je
-
-Kategorie:
-- bug: chyba v logice, neošetřená výjimka, špatná podmínka
-- security: XSS, SQL injection, citlivá data, autorizace, {dotnet_sec}
-- performance: N+1, zbytečné dotazy, velké cykly, {dotnet_perf}, {angular_perf}
-- test: chybějící unit testy pro změněné funkce
-- readability: špatné pojmenování, složitost, DRY
-- architecture: těsná vazba, špatný návrh
-- config: hardcoded hodnoty, chybějící env variables, secrets v kódu
-- error_handling: spolykané výjimky, chybějící fallback, špatné HTTP status kódy
-- logging: chybějící logy pro kritické operace, logování citlivých dat
-- migration: breaking changes v DB schématu, chybějící rollback strategie
-- dependency: nová závislost bez zdůvodnění, zranitelná verze balíčku
-- concurrency: race condition, chybějící zamykání, problém při paralelním zpracování
-
-Vrať POUZE validní JSON bez jakéhokoliv dalšího textu nebo markdown backticks.
-Všechny texty v JSON (overview, key_points, bugs, security, performance, tests, architecture, readability, regression_risk, goal_alignment, comment) piš v češtině. Technické termíny, názvy metod, proměnných, knihoven a programátorský slang ponechej v originále (např. "N+1 query", "race condition", "memory leak", názvy funkcí atd.).
 """
 
 
-async def call_claude(prompt: str) -> str:
-    """Zavolá Anthropic Claude API s exponential backoff retry (529, 503, timeout)."""
+# Zpětná kompatibilita
+def build_prompt(
+    diff: str,
+    jira: dict,
+    pr_title: str,
+    line_count: int,
+    ignored_files: list[str],
+    angular_version: str | None = None,
+    dotnet_version: str | None = None,
+) -> str:
+    return build_system_prompt() + "\n\n" + build_user_prompt(
+        diff, jira, pr_title, line_count, ignored_files, angular_version, dotnet_version
+    )
+
+
+async def call_claude(prompt: str = "", *, system_prompt: str = "", user_prompt: str = "") -> str:
+    """
+    Zavolá Anthropic Claude API s exponential backoff retry (529, 503, timeout).
+
+    Preferované volání: call_claude(system_prompt=..., user_prompt=...)
+      - system_prompt se cachuje (cache_control: ephemeral, TTL ~1 hodina)
+      - user_prompt se posílá bez cache (mění se s každým PR)
+    Zpětně kompatibilní: call_claude(prompt) — vše jako user message bez cache.
+    """
+    if system_prompt and user_prompt:
+        system_block = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+        messages = [{"role": "user", "content": user_prompt}]
+    else:
+        system_block = None
+        messages = [{"role": "user", "content": prompt}]
+
     delays = [2, 5, 10]  # sekundy mezi pokusy
     last_error: Exception | None = None
     for attempt, delay in enumerate([0] + delays, 1):
@@ -757,18 +800,22 @@ async def call_claude(prompt: str) -> str:
             await asyncio.sleep(delay)
         try:
             async with httpx.AsyncClient(timeout=120) as client:
+                payload: dict = {
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 8192,
+                    "messages": messages,
+                }
+                if system_block:
+                    payload["system"] = system_block
                 resp = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={
                         "x-api-key": ANTHROPIC_API_KEY,
                         "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "prompt-caching-2024-07-31",
                         "content-type": "application/json",
                     },
-                    json={
-                        "model": "claude-sonnet-4-6",
-                        "max_tokens": 8192,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
+                    json=payload,
                 )
                 if resp.status_code in (529, 503):
                     print(f"[Claude] Attempt {attempt} — overloaded ({resp.status_code}), retry...")
@@ -782,6 +829,14 @@ async def call_claude(prompt: str) -> str:
                     raise Exception(f"Claude API chyba (400): {err_msg}")
                 resp.raise_for_status()
                 data = resp.json()
+                usage = data.get("usage", {})
+                cache_read    = usage.get("cache_read_input_tokens", 0)
+                cache_created = usage.get("cache_creation_input_tokens", 0)
+                uncached      = usage.get("input_tokens", 0)
+                if cache_read or cache_created:
+                    total = cache_read + uncached
+                    usppora = f"{cache_read / total * 100:.0f}%" if total else "?"
+                    print(f"[Claude CACHE] read={cache_read} created={cache_created} uncached={uncached} | úspora={usppora} tokenů")
                 return data["content"][0]["text"]
         except httpx.TimeoutException as e:
             print(f"[Claude] Attempt {attempt} — timeout, retry...")
@@ -952,13 +1007,13 @@ async def bitbucket_webhook(request: Request):
     # -----------------------------------------------------------------------
     jira = await get_jira_ticket(jira_id) if jira_id else {}
 
-    prompt = build_prompt(
+    prompt = build_user_prompt(
         filtered_diff, jira, pr_title, line_count, ignored_files,
         angular_version=angular_version,
         dotnet_version=dotnet_version,
     )
     try:
-        raw = await call_claude(prompt)
+        raw = await call_claude(system_prompt=build_system_prompt(), user_prompt=prompt)
     except Exception as e:
         err_str = str(e)
         print(f"[Claude ERROR] {err_str}")
