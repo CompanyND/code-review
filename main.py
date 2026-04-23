@@ -163,6 +163,25 @@ def should_ignore_file(filename: str) -> bool:
     return False
 
 
+# Větve kam PR nechceme reviewovat (release, prod, mergeování)
+_SKIP_BRANCH_EXACT   = {"release", "prod", "produkce"}
+_SKIP_BRANCH_PREFIX  = ("release/", "prod/", "produkce/")
+_SKIP_BRANCH_SUFFIX  = ("/release", "/prod", "/produkce")
+
+def _is_skip_branch(branch: str) -> bool:
+    """Vrátí True pokud PR míří do větve která se nemá reviewovat."""
+    if not branch:
+        return False
+    b = branch.lower()
+    if b in _SKIP_BRANCH_EXACT:
+        return True
+    if b.startswith(_SKIP_BRANCH_PREFIX):
+        return True
+    if b.endswith(_SKIP_BRANCH_SUFFIX):
+        return True
+    return False
+
+
 def filter_diff(raw_diff: str) -> tuple[str, list[str]]:
     """
     Odfiltruje ignorované soubory z diffu.
@@ -940,6 +959,7 @@ async def bitbucket_webhook(request: Request):
     pr_title  = pr.get("title", "")
     pr_desc   = pr.get("description", "")
     branch    = pr.get("source", {}).get("branch", {}).get("name", "")
+    dest      = pr.get("destination", {}).get("branch", {}).get("name", "")
     repo      = payload.get("repository", {})
     diff_url  = pr.get("links", {}).get("diff", {}).get("href", "")
     full_name = repo.get("full_name", "")
@@ -950,6 +970,11 @@ async def bitbucket_webhook(request: Request):
 
     # Získej token pro repozitář (OAuth nebo per-repo fallback)
     token = await get_bb_token(repo_slug)
+
+    # Přeskoč PR mířící do release/prod větví — typicky merge bez změn kódu
+    if _is_skip_branch(dest):
+        print(f"[CR] PR #{pr_id} ignorován — destination větev '{dest}' je release/prod")
+        return JSONResponse({"status": "ignored", "reason": "skip_branch", "destination": dest, "pr_id": pr_id})
 
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
