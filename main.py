@@ -776,6 +776,10 @@ async def call_claude(prompt: str) -> str:
                     continue
                 if not resp.is_success:
                     print(f"[Claude ERROR] status={resp.status_code} body={resp.text}")
+                if resp.status_code == 400:
+                    body = resp.json()
+                    err_msg = body.get("error", {}).get("message", resp.text)
+                    raise Exception(f"Claude API chyba (400): {err_msg}")
                 resp.raise_for_status()
                 data = resp.json()
                 return data["content"][0]["text"]
@@ -953,7 +957,20 @@ async def bitbucket_webhook(request: Request):
         angular_version=angular_version,
         dotnet_version=dotnet_version,
     )
-    raw = await call_claude(prompt)
+    try:
+        raw = await call_claude(prompt)
+    except Exception as e:
+        err_str = str(e)
+        print(f"[Claude ERROR] {err_str}")
+        if "credit balance" in err_str or "400" in err_str:
+            await post_bitbucket_comment(workspace, repo_slug, pr_id,
+                f"🤖 **Automatické code review** (Claude AI)"
+                f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
+                f"⚠️ **Review se nezdařilo** — nedostatek kreditů na Anthropic API. "
+                f"Kontaktujte administrátora.",
+                token)
+            return JSONResponse({"status": "error", "reason": "claude_credits", "pr_id": pr_id})
+        raise
 
     # Parsuj JSON odpověď od Claudea
     try:
