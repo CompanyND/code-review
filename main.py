@@ -164,9 +164,9 @@ def should_ignore_file(filename: str) -> bool:
 
 
 # Větve kam PR nechceme reviewovat (release, prod, mergeování)
-_SKIP_BRANCH_EXACT   = {"release", "prod", "produkce"}
-_SKIP_BRANCH_PREFIX  = ("release/", "prod/", "produkce/")
-_SKIP_BRANCH_SUFFIX  = ("/release", "/prod", "/produkce")
+_SKIP_BRANCH_EXACT   = {"release"}
+_SKIP_BRANCH_PREFIX  = ("release/")
+_SKIP_BRANCH_SUFFIX  = ("/release")
 
 def _is_skip_branch(branch: str) -> bool:
     """Vrátí True pokud PR míří do větve která se nemá reviewovat."""
