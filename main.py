@@ -123,7 +123,7 @@ JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 # ---------------------------------------------------------------------------
 
 # Maximální počet změněných řádků — PR nad tento limit se NEPOŠLE na Claude
-POC_MAX_LINES = 1500
+POC_MAX_LINES = 8000
 
 # Soubory které se ignorují při počítání řádků i při review
 # Důvod: automaticky generované soubory, nemá smysl je reviewovat
