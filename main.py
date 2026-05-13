@@ -18,7 +18,7 @@ import hashlib
 import sqlite3
 import time
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
@@ -34,28 +34,32 @@ _db.execute(
 )
 _db.commit()
 
-def _is_already_processed(key: str) -> bool:
+def _is_already_processed_sync(key: str) -> bool:
     row = _db.execute(
         "SELECT ts FROM processed_prs WHERE key = ?", (key,)
     ).fetchone()
     if row and time.time() - row[0] < DEDUP_TTL:
         return True
-    # Expirovaný záznam — smaž
     _db.execute("DELETE FROM processed_prs WHERE key = ?", (key,))
     _db.commit()
     return False
 
-def _mark_as_processed(key: str) -> None:
+def _mark_as_processed_sync(key: str) -> None:
     _db.execute(
         "INSERT OR REPLACE INTO processed_prs (key, ts) VALUES (?, ?)",
         (key, time.time()),
     )
-    # Uklidění starých záznamů
     _db.execute(
         "DELETE FROM processed_prs WHERE ts < ?",
         (time.time() - DEDUP_TTL,),
     )
     _db.commit()
+
+async def _is_already_processed(key: str) -> bool:
+    return await asyncio.to_thread(_is_already_processed_sync, key)
+
+async def _mark_as_processed(key: str) -> None:
+    await asyncio.to_thread(_mark_as_processed_sync, key)
 
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
@@ -997,28 +1001,41 @@ async def post_bitbucket_comment(
     workspace: str, repo_slug: str, pr_id: int, comment: str, token: str,
     file_path: str | None = None, line: int | None = None
 ) -> None:
-    """Přidá komentář do PR – inline pokud je zadán soubor a řádek, jinak obecný."""
+    """Přidá komentář do PR s exponential backoff retry (5xx, timeout)."""
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
         f"{workspace}/{repo_slug}/pullrequests/{pr_id}/comments"
     )
     body: dict = {"content": {"raw": comment}}
-
     if file_path and line:
         body["inline"] = {"to": line, "path": file_path}
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            json=body,
-            timeout=15,
-        )
-        print(f"[BB COMMENT] status={resp.status_code} url={url} file={file_path} line={line} response={resp.text[:300]}")
-        if not resp.is_success:
-            print(f"[BB COMMENT ERROR] status={resp.status_code} body={resp.text}")
-        else:
-            resp.raise_for_status()
+    delays = [3, 8]
+    last_error: Exception | None = None
+    for attempt, delay in enumerate([0] + delays, 1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=body,
+                    timeout=15,
+                )
+                print(f"[BB COMMENT] attempt={attempt} status={resp.status_code} file={file_path} line={line}")
+                if resp.status_code in (500, 502, 503, 504):
+                    last_error = Exception(f"Bitbucket {resp.status_code}")
+                    continue
+                if not resp.is_success:
+                    print(f"[BB COMMENT ERROR] status={resp.status_code} body={resp.text[:300]}")
+                resp.raise_for_status()
+                return
+        except httpx.TimeoutException as e:
+            print(f"[BB COMMENT] attempt={attempt} — timeout, retry...")
+            last_error = e
+            continue
+    print(f"[BB COMMENT] Selhalo po {len(delays)+1} pokusech: {last_error} | file={file_path} line={line}")
 
 
 def format_severity(severity: str) -> str:
@@ -1052,17 +1069,166 @@ def format_category(category: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Webhook endpoint
+# Background review task
+# ---------------------------------------------------------------------------
+
+async def _run_review(
+    workspace: str, repo_slug: str, pr_id: int,
+    pr_title: str, branch: str, diff_url: str,
+    jira_id: str | None, token: str,
+) -> None:
+    """Celé review běží na pozadí — Bitbucket již obdržel 202."""
+    try:
+        raw_diff, (angular_version, dotnet_version) = await asyncio.gather(
+            get_bitbucket_diff(diff_url, token),
+            get_stack_versions(workspace, repo_slug, token),
+        )
+        print(f"[CR] Stack: Angular={angular_version or '?'} | .NET={dotnet_version or '?'}")
+
+        filtered_diff, ignored_files = filter_diff(raw_diff)
+        if ignored_files:
+            print(f"[CR] Ignorované soubory: {', '.join(ignored_files)}")
+
+        line_count = count_changed_lines(filtered_diff)
+        print(f"[CR] Změněných řádků po filtraci: {line_count} (limit: {POC_MAX_LINES})")
+
+        if line_count > POC_MAX_LINES:
+            skip_message = (
+                f"🤖 **Automatické code review** (Claude AI)"
+                f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
+                f"⚠️ **PR přeskočen — příliš velká změna**\n\n"
+                f"| Položka | Hodnota |\n"
+                f"|---------|--------|\n"
+                f"| Změněných řádků (bez generovaných souborů) | **{line_count}** |\n"
+                f"| Limit | {POC_MAX_LINES} řádků |\n"
+            )
+            if ignored_files:
+                skip_message += f"| Ignorované soubory | {', '.join(ignored_files)} |\n"
+            skip_message += (
+                f"\n💡 Pro ruční review doporučujeme rozdělit PR na menší části.\n"
+                f"Automatické review bude aktivováno po snížení počtu změn pod {POC_MAX_LINES} řádků."
+            )
+            await post_bitbucket_comment(workspace, repo_slug, pr_id, skip_message, token)
+            return
+
+        jira = await get_jira_ticket(jira_id) if jira_id else {}
+
+        prompt = build_user_prompt(
+            filtered_diff, jira, pr_title, line_count, ignored_files,
+            angular_version=angular_version,
+            dotnet_version=dotnet_version,
+        )
+        file_count = filtered_diff.count("diff --git ")
+        model = _select_model(line_count, filtered_diff, file_count)
+        try:
+            raw = await call_claude(system_prompt=build_system_prompt(), user_prompt=prompt, model=model)
+        except Exception as e:
+            err_str = str(e)
+            print(f"[Claude ERROR] {err_str}")
+            if "credit balance" in err_str or "400" in err_str:
+                await post_bitbucket_comment(workspace, repo_slug, pr_id,
+                    f"🤖 **Automatické code review** (Claude AI)"
+                    f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
+                    f"⚠️ **Review se nezdařilo** — nedostatek kreditů na Anthropic API. "
+                    f"Kontaktujte administrátora.",
+                    token)
+                return
+            raise
+
+        try:
+            clean  = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            review = json.loads(clean)
+        except json.JSONDecodeError as e:
+            print(f"[JSON ERROR] {e}\nRaw: {raw[:500]}")
+            await post_bitbucket_comment(workspace, repo_slug, pr_id,
+                f"🤖 **Automatické code review** (Claude AI){' | Jira: ' + jira_id if jira_id else ''}\n\n{raw}",
+                token)
+            return
+
+        summary  = review.get("summary", {})
+        comments = review.get("inline_comments", [])
+
+        rec      = summary.get("recommendation", "")
+        rec_icon = {"APPROVE": "✅", "REQUEST CHANGES": "❌", "NEEDS DISCUSSION": "💬"}.get(rec, "🤖")
+        points   = "\n".join(f"* {p}" for p in summary.get("key_points", []))
+
+        header = (
+            f"🤖 **Automatické code review** (Claude AI)"
+            f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
+            f"| Položka | Hodnota |\n"
+            f"|---------|--------|\n"
+            f"| Změněných řádků | {line_count} |\n"
+        )
+        if angular_version:
+            header += f"| Angular verze | {angular_version} |\n"
+        if dotnet_version:
+            header += f"| .NET verze | {dotnet_version} |\n"
+        if ignored_files:
+            header += f"| Ignorované soubory | {', '.join(ignored_files)} |\n"
+        header += (
+            f"\n---\n"
+            f"### {rec_icon} {rec}\n\n"
+            f"{summary.get('overview', '')}\n\n"
+            f"**Klíčové body:**\n{points}\n\n"
+            f"---\n"
+        )
+
+        sections = [
+            ("🐛 Bugy a logické chyby",  summary.get("bugs")),
+            ("🔒 Bezpečnost",             summary.get("security")),
+            ("⚡ Výkon",                  summary.get("performance")),
+            ("🧪 Unit testy",             summary.get("tests")),
+            ("🏗️ Návrh a architektura",  summary.get("architecture")),
+            ("📖 Čitelnost a konvence",   summary.get("readability")),
+            ("🔄 Riziko regresí",         summary.get("regression_risk")),
+            ("🎯 Soulad se zadáním",      summary.get("goal_alignment")),
+        ]
+        for title, value in sections:
+            if value and value not in (None, "null", "", "OK", "Nenalezeny", "Pokryto"):
+                header += f"### {title}\n{value}\n\n"
+
+        header += "---\n*Podrobné inline komentáře jsou přidány přímo k řádkům kódu níže.*"
+        await post_bitbucket_comment(workspace, repo_slug, pr_id, header, token)
+
+        async def _post_inline(item: dict) -> bool:
+            fp  = item.get("file", "")
+            ln  = item.get("line")
+            cmt = item.get("comment", "")
+            sev = item.get("severity", "minor")
+            cat = item.get("category", "")
+            if not fp or not ln or not cmt:
+                return False
+            text = f"🤖 **Claude - Code Review**\n---\n{format_severity(sev)} {format_category(cat)}\n\n{cmt}"
+            await post_bitbucket_comment(workspace, repo_slug, pr_id, text, token,
+                                         file_path=fp, line=ln)
+            return True
+
+        results = await asyncio.gather(*[_post_inline(c) for c in comments], return_exceptions=True)
+        posted  = sum(1 for r in results if r is True)
+        print(f"[CR] PR #{pr_id} hotovo | inline komentářů: {posted}")
+
+    except Exception as e:
+        print(f"[CR ERROR] PR #{pr_id} — neočekávaná chyba na pozadí: {e}")
+        try:
+            await post_bitbucket_comment(workspace, repo_slug, pr_id,
+                f"🤖 **Automatické code review** (Claude AI)\n\n"
+                f"⚠️ **Review se nezdařilo** — interní chyba. Kontaktujte administrátora.",
+                token)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Webhook endpoint — validace + dedup, pak 202 a práce na pozadí
 # ---------------------------------------------------------------------------
 
 @app.post("/webhook/bitbucket")
-async def bitbucket_webhook(request: Request):
+async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(500, "Chybí ANTHROPIC_API_KEY")
 
     body = await request.body()
 
-    # 2. Ověření webhook podpisu
     if BB_WEBHOOK_SECRET:
         signature = request.headers.get("X-Hub-Signature", "")
         if not _verify_webhook_signature(BB_WEBHOOK_SECRET, body, signature):
@@ -1088,178 +1254,29 @@ async def bitbucket_webhook(request: Request):
     if not all([pr_id, workspace, repo_slug, diff_url]):
         raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}'")
 
-    # Získej token pro repozitář (OAuth nebo per-repo fallback)
     token = await get_bb_token(repo_slug)
 
-    # Přeskoč PR mířící do release/prod větví — typicky merge bez změn kódu
     if _is_skip_branch(dest):
         print(f"[CR] PR #{pr_id} ignorován — destination větev '{dest}' je release/prod")
         return JSONResponse({"status": "ignored", "reason": "skip_branch", "destination": dest, "pr_id": pr_id})
 
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
-    # Deduplikace — ignoruj Bitbucket retry webhooky
     commit_hash = pr.get("source", {}).get("commit", {}).get("hash", "")
-    dedup_key = f"{workspace}/{repo_slug}/{pr_id}/{commit_hash}"
-    if _is_already_processed(dedup_key):
+    dedup_key   = f"{workspace}/{repo_slug}/{pr_id}/{commit_hash}"
+    if await _is_already_processed(dedup_key):
         print(f"[CR] PR #{pr_id} duplicate — ignoruji")
         return JSONResponse({"status": "duplicate", "pr_id": pr_id})
-    _mark_as_processed(dedup_key)
+    await _mark_as_processed(dedup_key)
 
-    print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
-
-    # Stáhni diff + detekuj stack verze paralelně (stack verze se cachují per repozitář)
-    raw_diff, (angular_version, dotnet_version) = await asyncio.gather(
-        get_bitbucket_diff(diff_url, token),
-        get_stack_versions(workspace, repo_slug, token),
+    print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id} — spouštím review na pozadí")
+    background_tasks.add_task(
+        _run_review,
+        workspace=workspace, repo_slug=repo_slug, pr_id=pr_id,
+        pr_title=pr_title, branch=branch, diff_url=diff_url,
+        jira_id=jira_id, token=token,
     )
-
-    print(f"[CR] Stack: Angular={angular_version or '?'} | .NET={dotnet_version or '?'}")
-
-    # -----------------------------------------------------------------------
-    # FILTR 1 — Odstraň ignorované soubory (package-lock.json atd.)
-    # -----------------------------------------------------------------------
-    filtered_diff, ignored_files = filter_diff(raw_diff)
-    if ignored_files:
-        print(f"[CR] Ignorované soubory: {', '.join(ignored_files)}")
-
-    # -----------------------------------------------------------------------
-    # FILTR 2 — Zkontroluj počet řádků
-    # Pokud je změn příliš mnoho → přidej informativní komentář, nepošli na Claude
-    # -----------------------------------------------------------------------
-    line_count = count_changed_lines(filtered_diff)
-    print(f"[CR] Změněných řádků po filtraci: {line_count} (limit: {POC_MAX_LINES})")
-
-    if line_count > POC_MAX_LINES:
-        skip_message = (
-            f"🤖 **Automatické code review** (Claude AI)"
-            f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
-            f"⚠️ **PR přeskočen — příliš velká změna**\n\n"
-            f"| Položka | Hodnota |\n"
-            f"|---------|--------|\n"
-            f"| Změněných řádků (bez generovaných souborů) | **{line_count}** |\n"
-            f"| Limit | {POC_MAX_LINES} řádků |\n"
-        )
-        if ignored_files:
-            skip_message += f"| Ignorované soubory | {', '.join(ignored_files)} |\n"
-        skip_message += (
-            f"\n💡 Pro ruční review doporučujeme rozdělit PR na menší části.\n"
-            f"Automatické review bude aktivováno po snížení počtu změn pod {POC_MAX_LINES} řádků."
-        )
-        await post_bitbucket_comment(workspace, repo_slug, pr_id, skip_message, token)
-        return JSONResponse({
-            "status": "skipped",
-            "reason": "too_many_lines",
-            "line_count": line_count,
-            "limit": POC_MAX_LINES,
-            "pr_id": pr_id,
-        })
-
-    # -----------------------------------------------------------------------
-    # PR je v limitu → pokračuj s Claude review
-    # -----------------------------------------------------------------------
-    jira = await get_jira_ticket(jira_id) if jira_id else {}
-
-    prompt = build_user_prompt(
-        filtered_diff, jira, pr_title, line_count, ignored_files,
-        angular_version=angular_version,
-        dotnet_version=dotnet_version,
-    )
-    file_count = filtered_diff.count("diff --git ")
-    model = _select_model(line_count, filtered_diff, file_count)
-    try:
-        raw = await call_claude(system_prompt=build_system_prompt(), user_prompt=prompt, model=model)
-    except Exception as e:
-        err_str = str(e)
-        print(f"[Claude ERROR] {err_str}")
-        if "credit balance" in err_str or "400" in err_str:
-            await post_bitbucket_comment(workspace, repo_slug, pr_id,
-                f"🤖 **Automatické code review** (Claude AI)"
-                f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
-                f"⚠️ **Review se nezdařilo** — nedostatek kreditů na Anthropic API. "
-                f"Kontaktujte administrátora.",
-                token)
-            return JSONResponse({"status": "error", "reason": "claude_credits", "pr_id": pr_id})
-        raise
-
-    # Parsuj JSON odpověď od Claudea
-    try:
-        clean  = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        review = json.loads(clean)
-    except json.JSONDecodeError as e:
-        print(f"[JSON ERROR] {e}\nRaw: {raw[:500]}")
-        await post_bitbucket_comment(workspace, repo_slug, pr_id,
-            f"🤖 **Automatické code review** (Claude AI){' | Jira: ' + jira_id if jira_id else ''}\n\n{raw}",
-            token)
-        return JSONResponse({"status": "ok", "pr_id": pr_id, "jira_id": jira_id, "mode": "fallback"})
-
-    summary  = review.get("summary", {})
-    comments = review.get("inline_comments", [])
-
-    # 1. Souhrnný komentář nahoře v PR
-    rec      = summary.get("recommendation", "")
-    rec_icon = {"APPROVE": "✅", "REQUEST CHANGES": "❌", "NEEDS DISCUSSION": "💬"}.get(rec, "🤖")
-    points   = "\n".join(f"* {p}" for p in summary.get("key_points", []))
-
-    header = (
-        f"🤖 **Automatické code review** (Claude AI)"
-        f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
-        f"| Položka | Hodnota |\n"
-        f"|---------|--------|\n"
-        f"| Změněných řádků | {line_count} |\n"
-    )
-    if angular_version:
-        header += f"| Angular verze | {angular_version} |\n"
-    if dotnet_version:
-        header += f"| .NET verze | {dotnet_version} |\n"
-    if ignored_files:
-        header += f"| Ignorované soubory | {', '.join(ignored_files)} |\n"
-    header += (
-        f"\n---\n"
-        f"### {rec_icon} {rec}\n\n"
-        f"{summary.get('overview', '')}\n\n"
-        f"**Klíčové body:**\n{points}\n\n"
-        f"---\n"
-    )
-
-    sections = [
-        ("🐛 Bugy a logické chyby",  summary.get("bugs")),
-        ("🔒 Bezpečnost",             summary.get("security")),
-        ("⚡ Výkon",                  summary.get("performance")),
-        ("🧪 Unit testy",             summary.get("tests")),
-        ("🏗️ Návrh a architektura",  summary.get("architecture")),
-        ("📖 Čitelnost a konvence",   summary.get("readability")),
-        ("🔄 Riziko regresí",         summary.get("regression_risk")),
-        ("🎯 Soulad se zadáním",      summary.get("goal_alignment")),
-    ]
-    for title, value in sections:
-        if value and value not in (None, "null", "", "OK", "Nenalezeny", "Pokryto"):
-            header += f"### {title}\n{value}\n\n"
-
-    header += "---\n*Podrobné inline komentáře jsou přidány přímo k řádkům kódu níže.*"
-
-    await post_bitbucket_comment(workspace, repo_slug, pr_id, header, token)
-
-    # 2. Inline komentáře přímo k řádkům — paralelně
-    async def _post_inline(item: dict) -> bool:
-        file_path = item.get("file", "")
-        line      = item.get("line")
-        comment   = item.get("comment", "")
-        severity  = item.get("severity", "minor")
-        category  = item.get("category", "")
-        if not file_path or not line or not comment:
-            return False
-        text = f"🤖 **Claude - Code Review**\n---\n{format_severity(severity)} {format_category(category)}\n\n{comment}"
-        await post_bitbucket_comment(workspace, repo_slug, pr_id, text, token,
-                                     file_path=file_path, line=line)
-        return True
-
-    results = await asyncio.gather(*[_post_inline(item) for item in comments])
-    posted = sum(1 for r in results if r)
-
-    print(f"[CR] PR #{pr_id} hotovo | inline komentářů: {posted}")
-    return JSONResponse({"status": "ok", "pr_id": pr_id, "jira_id": jira_id,
-                         "line_count": line_count, "inline_comments": posted})
+    return JSONResponse({"status": "accepted", "pr_id": pr_id, "jira_id": jira_id}, status_code=202)
 
 
 @app.get("/health")
