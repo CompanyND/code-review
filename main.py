@@ -364,6 +364,28 @@ async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str 
             return None
 
 
+# Cache stack verze per repozitář — Angular/NET se mění jednou za měsíce
+_stack_cache: dict[str, tuple[str | None, str | None, float]] = {}
+STACK_CACHE_TTL = 3600  # 1 hodina
+
+
+async def get_stack_versions(workspace: str, repo_slug: str, token: str) -> tuple[str | None, str | None]:
+    """Vrátí (angular_version, dotnet_version) s cachováním — šetří Bitbucket API volání."""
+    key = f"{workspace}/{repo_slug}"
+    if key in _stack_cache:
+        ang, net, ts = _stack_cache[key]
+        if time.time() - ts < STACK_CACHE_TTL:
+            print(f"[STACK CACHE] hit pro {key}")
+            return ang, net
+    ang, net = await asyncio.gather(
+        get_angular_version(workspace, repo_slug, token),
+        get_dotnet_version(workspace, repo_slug, token),
+    )
+    _stack_cache[key] = (ang, net, time.time())
+    print(f"[STACK CACHE] uloženo pro {key}: Angular={ang} .NET={net}")
+    return ang, net
+
+
 def _angular_note(version: str | None) -> str:
     """Vrátí kontext pro Claude podle verze Angularu."""
     if not version:
@@ -701,6 +723,65 @@ Kategorie inline komentářů:
 Texty v češtině. Technické termíny, názvy metod a proměnných ponechej v originále."""
 
 
+_FILE_PRIORITY: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"auth|login|password|permission|role|jwt|oauth|secret|encrypt", re.IGNORECASE), 100),
+    (re.compile(r"migration|seed|schema", re.IGNORECASE), 90),
+    (re.compile(r"\.(cs|ts|py|java|go|rb|php)$", re.IGNORECASE), 50),
+    (re.compile(r"\.(html|scss|sass|css)$", re.IGNORECASE), 30),
+]
+
+MAX_DIFF_CHARS = 400_000
+
+
+def _file_priority(filename: str) -> int:
+    if re.search(r"\.(spec|test)\.", filename, re.IGNORECASE):
+        return 10
+    for pattern, priority in _FILE_PRIORITY:
+        if pattern.search(filename):
+            return priority
+    return 20
+
+
+def prioritize_diff(diff: str) -> tuple[str, bool]:
+    """
+    Rozdělí diff na bloky per-soubor, seřadí podle důležitosti a zkrátí na MAX_DIFF_CHARS.
+    Bezpečnostní / auth soubory jdou první, testy poslední.
+    Vrátí (prioritizovaný diff, byl zkrácen?).
+    """
+    if len(diff) <= MAX_DIFF_CHARS:
+        return diff, False
+
+    blocks: list[tuple[int, str]] = []
+    current_lines: list[str] = []
+    current_file = ""
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_lines:
+                blocks.append((_file_priority(current_file), "".join(current_lines)))
+            parts = line.strip().split(" ")
+            current_file = parts[-1].lstrip("b/") if len(parts) >= 4 else ""
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    if current_lines:
+        blocks.append((_file_priority(current_file), "".join(current_lines)))
+
+    blocks.sort(key=lambda b: b[0], reverse=True)
+
+    result_parts: list[str] = []
+    used = 0
+    for _, block_text in blocks:
+        if used + len(block_text) > MAX_DIFF_CHARS:
+            if not result_parts:
+                result_parts.append(block_text[:MAX_DIFF_CHARS])
+            break
+        result_parts.append(block_text)
+        used += len(block_text)
+
+    return "".join(result_parts), True
+
+
 def build_user_prompt(
     diff: str,
     jira: dict,
@@ -751,13 +832,15 @@ def build_user_prompt(
             "IDisposable, N+1 dotazy v ORM\n"
         )
 
-    diff_preview = diff[:16000] + ("\n...[diff zkrácen]" if len(diff) > 16000 else "")
+    diff_preview, was_truncated = prioritize_diff(diff)
+    if was_truncated:
+        diff_preview += "\n...[diff zkrácen — zobrazeny soubory s nejvyšší prioritou]"
 
-    # WCAG + Core Web Vitals — pouze pokud diff obsahuje HTML nebo SASS/CSS soubory
+    # WCAG + Core Web Vitals — kontrolujeme originální diff, ne zkrácený
     has_frontend_files = any(
-        f.endswith((".html", ".scss", ".sass", ".css"))
-        for f in (diff_preview.split("\n") if diff_preview else [])
-        if f.startswith("diff --git")
+        line.endswith((".html", ".scss", ".sass", ".css"))
+        for line in diff.splitlines()
+        if line.startswith("diff --git")
     )
     wcag_section = ""
     if has_frontend_files:
@@ -805,7 +888,44 @@ def build_prompt(
     )
 
 
-async def call_claude(prompt: str = "", *, system_prompt: str = "", user_prompt: str = "") -> str:
+_SECURITY_FILENAME_PATTERN = re.compile(
+    r"auth|login|password|permission|role|secret|encrypt|decrypt|jwt|oauth",
+    re.IGNORECASE,
+)
+_DEPENDENCY_FILENAME_PATTERN = re.compile(
+    r"\.(csproj|vbproj|fsproj)$|^package\.json$",
+    re.IGNORECASE,
+)
+
+
+def _select_model(line_count: int, diff: str, file_count: int) -> str:
+    """Vybere model podle složitosti PR. Opus pro komplexní, Sonnet pro jednoduché."""
+    score = 0
+    if line_count > 1000:
+        score += 1
+    if file_count > 15:
+        score += 1
+    has_security = False
+    has_dependency = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            filename = line.strip().split(" ")[-1].lstrip("b/")
+            if not has_security and _SECURITY_FILENAME_PATTERN.search(filename):
+                has_security = True
+                score += 1
+            if not has_dependency and (
+                _DEPENDENCY_FILENAME_PATTERN.search(filename) or "migration" in filename.lower()
+            ):
+                has_dependency = True
+                score += 1
+        if has_security and has_dependency:
+            break
+    model = "claude-opus-4-7" if score >= 2 else "claude-sonnet-4-6"
+    print(f"[Claude MODEL] score={score} → {model} (lines={line_count} files={file_count})")
+    return model
+
+
+async def call_claude(prompt: str = "", *, system_prompt: str = "", user_prompt: str = "", model: str = "claude-sonnet-4-6") -> str:
     """
     Zavolá Anthropic Claude API s exponential backoff retry (529, 503, timeout).
 
@@ -829,7 +949,7 @@ async def call_claude(prompt: str = "", *, system_prompt: str = "", user_prompt:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 payload: dict = {
-                    "model": "claude-sonnet-4-6",
+                    "model": model,
                     "max_tokens": 8192,
                     "messages": messages,
                 }
@@ -988,11 +1108,10 @@ async def bitbucket_webhook(request: Request):
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
-    # Stáhni diff + detekuj stack verze paralelně
-    raw_diff, angular_version, dotnet_version = await asyncio.gather(
+    # Stáhni diff + detekuj stack verze paralelně (stack verze se cachují per repozitář)
+    raw_diff, (angular_version, dotnet_version) = await asyncio.gather(
         get_bitbucket_diff(diff_url, token),
-        get_angular_version(workspace, repo_slug, token),
-        get_dotnet_version(workspace, repo_slug, token),
+        get_stack_versions(workspace, repo_slug, token),
     )
 
     print(f"[CR] Stack: Angular={angular_version or '?'} | .NET={dotnet_version or '?'}")
@@ -1046,8 +1165,10 @@ async def bitbucket_webhook(request: Request):
         angular_version=angular_version,
         dotnet_version=dotnet_version,
     )
+    file_count = filtered_diff.count("diff --git ")
+    model = _select_model(line_count, filtered_diff, file_count)
     try:
-        raw = await call_claude(system_prompt=build_system_prompt(), user_prompt=prompt)
+        raw = await call_claude(system_prompt=build_system_prompt(), user_prompt=prompt, model=model)
     except Exception as e:
         err_str = str(e)
         print(f"[Claude ERROR] {err_str}")
@@ -1143,7 +1264,6 @@ async def bitbucket_webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    configured_repos = [repo for repo, token in BB_TOKENS.items() if token]
     return {
         "status": "ok",
         "anthropic": "ok" if ANTHROPIC_API_KEY else "missing",
@@ -1154,4 +1274,5 @@ async def health():
             "max_lines": POC_MAX_LINES,
             "ignored_files": IGNORED_FILES,
         },
+        "stack_cache_entries": len(_stack_cache),
     }
